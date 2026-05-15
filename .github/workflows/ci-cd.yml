@@ -10,7 +10,7 @@ on:
 
 env:
   PYTHON_VERSION: "3.11"
-  IMAGE_NAME: mlops-challenge
+  IMAGE_NAME: mlops-neural-machine-translation
   REGISTRY: ghcr.io
 
 permissions:
