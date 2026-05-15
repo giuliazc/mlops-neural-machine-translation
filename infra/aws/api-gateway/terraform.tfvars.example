@@ -1,0 +1,22 @@
+aws_region = "us-east-1"
+api_name   = "mlops-inference-api-dev"
+stage_name = "dev"
+
+# Substitua pelos outputs do Terraform de infra/aws/ecs.
+backend_base_url   = "http://internal-mlops-api-nlb-abc123.us-east-1.elb.amazonaws.com"
+vpc_link_target_arn = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/net/mlops-api-nlb/abc123"
+
+client_api_key_name = "mlops-client-dev"
+
+# Valores simulados. Substitua por secrets reais e nao versione terraform.tfvars.
+client_api_key_value = "replace-client-api-key-dev-123456"
+
+client_rate_limit  = 20
+client_burst_limit = 40
+
+log_retention_days = 14
+
+# CloudWatch alarms. Informe ARNs SNS se quiser notificacoes.
+alarm_actions                     = []
+gateway_5xx_alarm_threshold       = 5
+gateway_latency_alarm_threshold_ms = 3000

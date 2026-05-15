@@ -1,0 +1,39 @@
+# ==========================================
+# AWS ECS Terraform Configuration
+# ==========================================
+# Copie este arquivo para terraform.tfvars e preencha os valores abaixo
+
+# Região da AWS onde os recursos serão criados
+aws_region = "us-east-1"
+
+# Nome do projeto (será usado como prefixo em todos os recursos)
+project_name = "mlops-api"
+
+# URL completa da imagem Docker no Container Registry
+# Exemplos:
+#   - ECR: "123456789012.dkr.ecr.us-east-1.amazonaws.com/mlops-challenge:latest"
+#   - GHCR: "ghcr.io/seu-usuario/mlops-challenge:latest"
+#   - Docker Hub: "seu-usuario/mlops-challenge:latest"
+container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/mlops-challenge:latest"
+
+# Porta interna do container (não mude, a API FastAPI usa 8000)
+container_port = 8000
+
+# Sentry
+sentry_dsn                = ""
+sentry_environment        = "production"
+sentry_traces_sample_rate = 0.2
+
+# Bucket S3 para artefatos aprovados. Se vazio, Terraform gera:
+# <project_name>-artifacts-<account_id>-<region>
+artifact_bucket_name = ""
+artifact_prefix      = "models"
+
+# Use true apenas em ambientes descartaveis.
+artifact_bucket_force_destroy = false
+
+# CloudWatch
+ecs_log_retention_days        = 14
+alarm_actions                 = []
+nlb_target_resets_alarm_threshold = 5
+nlb_unhealthy_hosts_threshold     = 1

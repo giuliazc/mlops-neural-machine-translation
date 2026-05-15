@@ -1,0 +1,554 @@
+{
+  "id": "mlops-nmt-pipeline",
+  "name": "MLOps Pipeline EN-PT",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Logica Principal\nWebhook -> Preparar Parametros -> Validar Parametros -> Preparar Dados -> Treinar -> Validar -> Publicar Artefatos -> Deploy -> Resposta JSON",
+        "height": 220,
+        "width": 360,
+        "color": 4
+      },
+      "id": "5f41d731-3c71-4cf0-89e0-5f37de629061",
+      "name": "Sticky Note - Logica Principal",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Monitoramento de Erros\nError Trigger captura falhas do workflow e envia notificacao dinamica com execution_id, node, erro e timestamp.",
+        "height": 220,
+        "width": 360,
+        "color": 3
+      },
+      "id": "8fdf8dd5-80ad-4578-9935-08ecb55502db",
+      "name": "Sticky Note - Monitoramento de Erros",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "mlops-nmt-pipeline",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "99e6fe73-9839-4671-a990-87f240e6819f",
+      "name": "Webhook - Iniciar Pipeline",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -660,
+        40
+      ],
+      "webhookId": "mlops-nmt-pipeline"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dataset-name",
+              "name": "dataset_name",
+              "type": "string",
+              "value": "={{ $json.body?.dataset_name || 'para_crawl/enpt' }}"
+            },
+            {
+              "id": "max-tokens",
+              "name": "max_tokens",
+              "type": "number",
+              "value": "={{ Number($json.body?.max_tokens || 64) }}"
+            },
+            {
+              "id": "train-records",
+              "name": "train_records",
+              "type": "number",
+              "value": "={{ Number($json.body?.train_records || 20000) }}"
+            },
+            {
+              "id": "val-records",
+              "name": "val_records",
+              "type": "number",
+              "value": "={{ Number($json.body?.val_records || 2000) }}"
+            },
+            {
+              "id": "seed",
+              "name": "seed",
+              "type": "number",
+              "value": "={{ Number($json.body?.seed || 42) }}"
+            },
+            {
+              "id": "epochs",
+              "name": "epochs",
+              "type": "number",
+              "value": "={{ Number($json.body?.epochs || 10) }}"
+            },
+            {
+              "id": "batch-size",
+              "name": "batch_size",
+              "type": "number",
+              "value": "={{ Number($json.body?.batch_size || 32) }}"
+            },
+            {
+              "id": "threshold",
+              "name": "threshold",
+              "type": "number",
+              "value": "={{ Number($json.body?.threshold || 0.30) }}"
+            },
+            {
+              "id": "git-sha",
+              "name": "git_sha",
+              "type": "string",
+              "value": "={{ $json.body?.git_sha || 'unknown' }}"
+            },
+            {
+              "id": "api-base-url",
+              "name": "api_base_url",
+              "type": "string",
+              "value": "={{ $json.body?.api_base_url || '' }}"
+            },
+            {
+              "id": "api-gateway-api-key",
+              "name": "api_gateway_api_key",
+              "type": "string",
+              "value": "={{ $json.body?.api_gateway_api_key || $json.headers?.['x-api-key'] || '' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bb214e1e-e542-4129-bb6b-e0125ee611f1",
+      "name": "Preparar Parametros",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -420,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nconst positiveIntegerFields = ['max_tokens', 'train_records', 'val_records', 'seed', 'epochs', 'batch_size'];\nconst errors = [];\n\nfor (const field of positiveIntegerFields) {\n  const value = Number(input[field]);\n  if (!Number.isInteger(value) || value <= 0) {\n    errors.push(`${field} deve ser um inteiro positivo. Valor recebido: ${input[field]}`);\n  }\n}\n\nconst threshold = Number(input.threshold);\nif (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {\n  errors.push(`threshold deve ser um numero entre 0 e 1. Valor recebido: ${input.threshold}`);\n}\n\nconst apiBaseUrl = String(input.api_base_url || '').trim();\nif (!/^https?:\\/\\/[^\\s/$.?#].[^\\s]*$/.test(apiBaseUrl)) {\n  errors.push(`api_base_url invalida: ${input.api_base_url}`);\n}\n\nif (!input.dataset_name || typeof input.dataset_name !== 'string') {\n  errors.push('dataset_name deve ser uma string nao vazia.');\n}\n\nif (!input.api_gateway_api_key || typeof input.api_gateway_api_key !== 'string') {\n  errors.push('api_gateway_api_key deve ser informado no payload ou no header x-api-key.');\n}\n\nif (errors.length > 0) {\n  throw new Error(`Parametros invalidos: ${errors.join(' | ')}`);\n}\n\nreturn [{\n  json: {\n    ...input,\n    api_base_url: apiBaseUrl,\n    pipeline_status: 'parameters_validated',\n    pipeline_started_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "8eb9e92f-6db1-4ba6-9d6e-d8df837a2674",
+      "name": "Validar Parametros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -290,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=DATASET_NAME='{{ $json.dataset_name }}' MAX_TOKENS='{{ $json.max_tokens }}' TRAIN_RECORDS='{{ $json.train_records }}' VAL_RECORDS='{{ $json.val_records }}' SEED='{{ $json.seed }}' docker compose run --rm prepare_dataset"
+      },
+      "id": "1d64535d-f242-4c26-82c0-a15420672b06",
+      "name": "Preparar Dados - Container",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=EPOCHS='{{ $('Validar Parametros').item.json.epochs }}' BATCH_SIZE='{{ $('Validar Parametros').item.json.batch_size }}' THRESHOLD='{{ $('Validar Parametros').item.json.threshold }}' MAX_TOKENS='{{ $('Validar Parametros').item.json.max_tokens }}' GIT_SHA='{{ $('Validar Parametros').item.json.git_sha }}' docker compose run --rm train"
+      },
+      "id": "65e8c062-3a20-4600-8e6d-48f1a40ab6a5",
+      "name": "Treinar Modelo - Container",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        220,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const stdout = $json.stdout || '';\nconst stderr = $json.stderr || '';\nconst lines = stdout.split(/\\r?\\n/).map(line => line.trim()).filter(Boolean);\n\nconst summaryLine = [...lines].reverse().find(line => {\n  try {\n    const parsed = JSON.parse(line);\n    return parsed.stage === 'train' && parsed.run_id;\n  } catch (error) {\n    return false;\n  }\n});\n\nif (!summaryLine) {\n  throw new Error(`Resumo JSON do treino nao encontrado. stderr=${stderr.slice(0, 1000)}`);\n}\n\nconst summary = JSON.parse(summaryLine);\nreturn [{\n  json: {\n    ...$('Validar Parametros').item.json,\n    train_stdout: stdout,\n    train_stderr: stderr,\n    ...summary\n  }\n}];"
+      },
+      "id": "b1be229a-6597-4d07-9512-371982e90a2c",
+      "name": "Extrair Run ID e Metricas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "status-approved",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "approved",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "metric-threshold",
+              "leftValue": "={{ Number($json.metric_value) }}",
+              "rightValue": "={{ Number($json.threshold) }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "45f8359b-9b6f-4e29-8ad9-4b08a57972e6",
+      "name": "Validar Threshold de Qualidade",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        740,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=docker compose --profile publish run --rm -e RUN_DIR='artifacts/{{ $json.run_id }}' -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_DEFAULT_REGION -e AWS_REGION -e AWS_ENDPOINT_URL -e AWS_ENDPOINT_URL_S3 -e ARTIFACT_BUCKET -e ARTIFACT_PREFIX -e MLOPS_CREATE_ARTIFACT_BUCKET publish_artifacts"
+      },
+      "id": "3af35e02-bccf-47f2-a1f2-3022b8d6d578",
+      "name": "Publicar Artefatos - Container",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const stdout = $json.stdout || '';\nconst publishedLine = stdout.split(/\\r?\\n/).map(line => line.trim()).filter(Boolean).reverse().find(line => line.startsWith('{'));\nconst published = publishedLine ? JSON.parse(publishedLine) : {};\nreturn [{\n  json: {\n    ...$('Extrair Run ID e Metricas').item.json,\n    publication: published,\n    publication_stdout: stdout,\n    publication_stderr: $json.stderr || ''\n  }\n}];"
+      },
+      "id": "2279646a-9734-4ec9-bd09-f2ff627b4a6d",
+      "name": "Consolidar Publicacao",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Validar Parametros').item.json.api_base_url }}/reload",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"run_id\":\"{{ $('Consolidar Publicacao').item.json.run_id }}\",\"artifact_bucket\":\"{{ $('Consolidar Publicacao').item.json.publication.bucket }}\",\"artifact_prefix\":\"{{ $('Consolidar Publicacao').item.json.publication.prefix }}\"}",
+        "options": {
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $('Validar Parametros').item.json.api_gateway_api_key }}"
+            }
+          ]
+        }
+      },
+      "id": "7419b202-09d5-49d8-940e-a6a26c87d4da",
+      "name": "Recarregar Modelo Publicado",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1800,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const consolidated = $('Consolidar Publicacao').item.json;\nconst reloadResponse = $json;\nreturn [{\n  json: {\n    execution_id: $execution.id,\n    status: 'deployed',\n    deploy_blocked: false,\n    run_id: consolidated.run_id,\n    metric_name: consolidated.metric_name,\n    metric_value: consolidated.metric_value,\n    threshold: consolidated.threshold,\n    artifact_publication: consolidated.publication,\n    reload_response: reloadResponse,\n    pipeline_started_at: consolidated.pipeline_started_at,\n    pipeline_finished_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "317ddc63-b5ed-4d98-afc3-d2645f2bda44",
+      "name": "Resposta - Sucesso",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{\n  json: {\n    execution_id: $execution.id,\n    status: 'rejected',\n    deploy_blocked: true,\n    reason: 'quality_gate_failed',\n    run_id: $json.run_id,\n    training_status: $json.status,\n    metric_name: $json.metric_name,\n    metric_value: $json.metric_value,\n    threshold: $json.threshold,\n    pipeline_started_at: $json.pipeline_started_at,\n    pipeline_finished_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "b9d68117-f0e1-4a6d-8fb3-b1364a19d7cf",
+      "name": "Resposta - Modelo Rejeitado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        180
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "dd51eef9-88ef-48e5-aa6c-c95d1e7a2214",
+      "name": "Error Trigger - Capturar Falhas",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{\n  json: {\n    execution_id: $execution.id,\n    status: 'error',\n    failed_node: $error.node?.name || 'unknown',\n    message: $error.message,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "fa3b82c9-60b8-4f64-981a-5222a636c357",
+      "name": "Registrar Incidente",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "artifact-local-only",
+              "leftValue": "={{ Boolean($json.publication?.local_only) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8e5bc6ad-9f5f-4dbd-81a6-15c3775d4d7c",
+      "name": "Verificar Backend de Artefatos",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const consolidated = $json;\nreturn [{\n  json: {\n    execution_id: $execution.id,\n    status: 'published_local_only',\n    deploy_blocked: false,\n    reload_skipped: true,\n    reload_skip_reason: 'artifact_published_to_localstack',\n    run_id: consolidated.run_id,\n    metric_name: consolidated.metric_name,\n    metric_value: consolidated.metric_value,\n    threshold: consolidated.threshold,\n    artifact_publication: consolidated.publication,\n    pipeline_started_at: consolidated.pipeline_started_at,\n    pipeline_finished_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "6d2b3bc1-ccef-4ef0-87e1-82e6c4a8220f",
+      "name": "Resposta - Publicacao Local",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        -180
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Iniciar Pipeline": {
+      "main": [
+        [
+          {
+            "node": "Preparar Parametros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Parametros": {
+      "main": [
+        [
+          {
+            "node": "Validar Parametros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar Parametros": {
+      "main": [
+        [
+          {
+            "node": "Preparar Dados - Container",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Dados - Container": {
+      "main": [
+        [
+          {
+            "node": "Treinar Modelo - Container",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Treinar Modelo - Container": {
+      "main": [
+        [
+          {
+            "node": "Extrair Run ID e Metricas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair Run ID e Metricas": {
+      "main": [
+        [
+          {
+            "node": "Validar Threshold de Qualidade",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar Threshold de Qualidade": {
+      "main": [
+        [
+          {
+            "node": "Publicar Artefatos - Container",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resposta - Modelo Rejeitado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publicar Artefatos - Container": {
+      "main": [
+        [
+          {
+            "node": "Consolidar Publicacao",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar Publicacao": {
+      "main": [
+        [
+          {
+            "node": "Verificar Backend de Artefatos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recarregar Modelo Publicado": {
+      "main": [
+        [
+          {
+            "node": "Resposta - Sucesso",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger - Capturar Falhas": {
+      "main": [
+        [
+          {
+            "node": "Registrar Incidente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Backend de Artefatos": {
+      "main": [
+        [
+          {
+            "node": "Resposta - Publicacao Local",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Recarregar Modelo Publicado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "mlops"
+    },
+    {
+      "name": "error-monitoring"
+    },
+    {
+      "name": "n8n"
+    }
+  ],
+  "triggerCount": 2,
+  "updatedAt": "2026-05-07T00:00:00.000Z",
+  "versionId": "1"
+}

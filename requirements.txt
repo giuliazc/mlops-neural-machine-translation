@@ -1,0 +1,11 @@
+tensorflow==2.20.0
+tensorflow-text==2.20.1
+tensorflow-datasets>=4.9.9
+importlib_resources>=6.5.0
+fastapi>=0.129.0
+uvicorn[standard]>=0.41.0
+pytest>=9.0.2
+httpx>=0.28.1
+wrapt==2.1.1
+sentry-sdk[fastapi]
+boto3>=1.34.0

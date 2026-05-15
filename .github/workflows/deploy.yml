@@ -1,0 +1,385 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows:
+      - ci-cd
+    types:
+      - completed
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: mlops-challenge
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'mlops-challenge' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'mlops-api' }}
+  TERRAFORM_VERSION: 1.6.6
+  ARTIFACT_PREFIX: ${{ vars.ARTIFACT_PREFIX || 'models' }}
+  API_GATEWAY_STAGE_NAME: ${{ vars.API_GATEWAY_STAGE_NAME || 'dev' }}
+  API_GATEWAY_NAME: ${{ vars.API_GATEWAY_NAME || 'mlops-inference-api-dev' }}
+  API_GATEWAY_CLIENT_KEY_NAME: ${{ vars.API_GATEWAY_CLIENT_KEY_NAME || 'mlops-client-dev' }}
+  API_GATEWAY_RATE_LIMIT: ${{ vars.API_GATEWAY_RATE_LIMIT || '20' }}
+  API_GATEWAY_BURST_LIMIT: ${{ vars.API_GATEWAY_BURST_LIMIT || '40' }}
+  API_GATEWAY_LOG_RETENTION_DAYS: ${{ vars.API_GATEWAY_LOG_RETENTION_DAYS || '14' }}
+  ECS_LOG_RETENTION_DAYS: ${{ vars.ECS_LOG_RETENTION_DAYS || '14' }}
+  SENTRY_ENVIRONMENT: ${{ vars.SENTRY_ENVIRONMENT || 'production' }}
+  SENTRY_TRACES_SAMPLE_RATE: ${{ vars.SENTRY_TRACES_SAMPLE_RATE || '0.2' }}
+  NLB_TARGET_RESETS_ALARM_THRESHOLD: ${{ vars.NLB_TARGET_RESETS_ALARM_THRESHOLD || '5' }}
+  NLB_UNHEALTHY_HOSTS_THRESHOLD: ${{ vars.NLB_UNHEALTHY_HOSTS_THRESHOLD || '1' }}
+  GATEWAY_5XX_ALARM_THRESHOLD: ${{ vars.GATEWAY_5XX_ALARM_THRESHOLD || '5' }}
+  GATEWAY_LATENCY_ALARM_THRESHOLD_MS: ${{ vars.GATEWAY_LATENCY_ALARM_THRESHOLD_MS || '3000' }}
+  TERRAFORM_STATE_BUCKET: ${{ vars.TERRAFORM_STATE_BUCKET }}
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  terraform-deploy:
+    name: Terraform ECS + API Gateway
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    env:
+      AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+
+    steps:
+      - name: Checkout deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute image tag
+        id: image-tag
+        run: |
+          echo "image_tag=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
+        if: env.AWS_GITHUB_ACTIONS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure AWS credentials via access keys
+        if: env.AWS_GITHUB_ACTIONS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Build and publish image to ECR
+        id: image
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_TAG="${{ steps.image-tag.outputs.image_tag }}"
+
+          aws ecr describe-repositories \
+            --repository-names "${ECR_REPOSITORY}" \
+            >/dev/null 2>&1 || \
+          aws ecr create-repository \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256
+
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+          docker build \
+            --tag "${IMAGE_URI}:${IMAGE_TAG}" \
+            --tag "${IMAGE_URI}:latest" \
+            .
+          docker push "${IMAGE_URI}:${IMAGE_TAG}"
+          docker push "${IMAGE_URI}:latest"
+
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Bootstrap Terraform remote state
+        id: tf-backend
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          STATE_BUCKET="${TERRAFORM_STATE_BUCKET:-mlops-challenge-tfstate-${ACCOUNT_ID}-${AWS_REGION}}"
+
+          if ! aws s3api head-bucket --bucket "${STATE_BUCKET}" 2>/dev/null; then
+            if [ "${AWS_REGION}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "${STATE_BUCKET}"
+            else
+              aws s3api create-bucket \
+                --bucket "${STATE_BUCKET}" \
+                --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
+            fi
+          fi
+
+          aws s3api put-bucket-versioning \
+            --bucket "${STATE_BUCKET}" \
+            --versioning-configuration Status=Enabled
+          aws s3api put-bucket-encryption \
+            --bucket "${STATE_BUCKET}" \
+            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          aws s3api put-public-access-block \
+            --bucket "${STATE_BUCKET}" \
+            --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+          echo "bucket=${STATE_BUCKET}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Init ECS
+        working-directory: infra/aws/ecs
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.tf-backend.outputs.bucket }}" \
+            -backend-config="key=ecs/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: Import existing ECS resources
+        working-directory: infra/aws/ecs
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_project_name: ${{ env.PROJECT_NAME }}
+          TF_VAR_container_image: ${{ steps.image.outputs.image_uri }}:${{ steps.image.outputs.image_tag }}
+          TF_VAR_sentry_dsn: ${{ secrets.SENTRY_DSN }}
+          TF_VAR_sentry_environment: ${{ env.SENTRY_ENVIRONMENT }}
+          TF_VAR_sentry_traces_sample_rate: ${{ env.SENTRY_TRACES_SAMPLE_RATE }}
+          TF_VAR_artifact_bucket_name: ${{ vars.ARTIFACT_BUCKET_NAME }}
+          TF_VAR_artifact_prefix: ${{ env.ARTIFACT_PREFIX }}
+          TF_VAR_ecs_log_retention_days: ${{ env.ECS_LOG_RETENTION_DAYS }}
+          TF_VAR_alarm_actions: ${{ vars.CLOUDWATCH_ALARM_ACTIONS_JSON || '[]' }}
+          TF_VAR_nlb_target_resets_alarm_threshold: ${{ env.NLB_TARGET_RESETS_ALARM_THRESHOLD }}
+          TF_VAR_nlb_unhealthy_hosts_threshold: ${{ env.NLB_UNHEALTHY_HOSTS_THRESHOLD }}
+        run: |
+          set -e
+
+          import_if_missing() {
+            local address="$1"
+            local resource_id="$2"
+            if [ -z "${resource_id}" ] || [ "${resource_id}" = "None" ]; then
+              return 0
+            fi
+            if terraform state show "${address}" >/dev/null 2>&1; then
+              return 0
+            fi
+            terraform import -input=false "${address}" "${resource_id}" || true
+          }
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          VPC_ID="$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' \
+            --output text)"
+          ARTIFACT_BUCKET="${TF_VAR_artifact_bucket_name:-${PROJECT_NAME}-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
+
+          SG_ID="$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${PROJECT_NAME}-ecs-tasks-sg" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || true)"
+          NLB_ARN="$(aws elbv2 describe-load-balancers \
+            --names "${PROJECT_NAME}-nlb" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null || true)"
+          TG_ARN="$(aws elbv2 describe-target-groups \
+            --names "${PROJECT_NAME}-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text 2>/dev/null || true)"
+          LISTENER_ARN=""
+          if [ -n "${NLB_ARN}" ] && [ "${NLB_ARN}" != "None" ]; then
+            LISTENER_ARN="$(aws elbv2 describe-listeners \
+              --load-balancer-arn "${NLB_ARN}" \
+              --query 'Listeners[?Port==`80`].ListenerArn | [0]' \
+              --output text 2>/dev/null || true)"
+          fi
+
+          import_if_missing "aws_s3_bucket.artifacts" "${ARTIFACT_BUCKET}"
+          import_if_missing "aws_s3_bucket_public_access_block.artifacts" "${ARTIFACT_BUCKET}"
+          import_if_missing "aws_s3_bucket_versioning.artifacts" "${ARTIFACT_BUCKET}"
+          import_if_missing "aws_s3_bucket_server_side_encryption_configuration.artifacts" "${ARTIFACT_BUCKET}"
+          import_if_missing "aws_security_group.ecs_tasks_sg" "${SG_ID}"
+          import_if_missing "aws_lb.api_nlb" "${NLB_ARN}"
+          import_if_missing "aws_lb_target_group.api_tg" "${TG_ARN}"
+          import_if_missing "aws_lb_listener.http" "${LISTENER_ARN}"
+          import_if_missing "aws_iam_role.ecs_task_execution_role" "${PROJECT_NAME}-ecs-execution-role"
+          import_if_missing "aws_iam_role.ecs_task_role" "${PROJECT_NAME}-ecs-task-role"
+          import_if_missing "aws_iam_policy.artifact_read" "arn:aws:iam::${ACCOUNT_ID}:policy/${PROJECT_NAME}-artifact-read"
+          import_if_missing "aws_ecs_cluster.main" "${PROJECT_NAME}-cluster"
+          import_if_missing "aws_cloudwatch_log_group.ecs_logs" "/ecs/${PROJECT_NAME}"
+          import_if_missing "aws_ecs_service.api" "${PROJECT_NAME}-cluster/${PROJECT_NAME}-service"
+          import_if_missing "aws_cloudwatch_metric_alarm.nlb_target_resets" "${PROJECT_NAME}-nlb-target-resets"
+          import_if_missing "aws_cloudwatch_metric_alarm.nlb_unhealthy_hosts" "${PROJECT_NAME}-nlb-unhealthy-hosts"
+
+      - name: Terraform Plan ECS
+        working-directory: infra/aws/ecs
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_project_name: ${{ env.PROJECT_NAME }}
+          TF_VAR_container_image: ${{ steps.image.outputs.image_uri }}:${{ steps.image.outputs.image_tag }}
+          TF_VAR_sentry_dsn: ${{ secrets.SENTRY_DSN }}
+          TF_VAR_sentry_environment: ${{ env.SENTRY_ENVIRONMENT }}
+          TF_VAR_sentry_traces_sample_rate: ${{ env.SENTRY_TRACES_SAMPLE_RATE }}
+          TF_VAR_artifact_bucket_name: ${{ vars.ARTIFACT_BUCKET_NAME }}
+          TF_VAR_artifact_prefix: ${{ env.ARTIFACT_PREFIX }}
+          TF_VAR_ecs_log_retention_days: ${{ env.ECS_LOG_RETENTION_DAYS }}
+          TF_VAR_alarm_actions: ${{ vars.CLOUDWATCH_ALARM_ACTIONS_JSON || '[]' }}
+          TF_VAR_nlb_target_resets_alarm_threshold: ${{ env.NLB_TARGET_RESETS_ALARM_THRESHOLD }}
+          TF_VAR_nlb_unhealthy_hosts_threshold: ${{ env.NLB_UNHEALTHY_HOSTS_THRESHOLD }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply ECS
+        working-directory: infra/aws/ecs
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_project_name: ${{ env.PROJECT_NAME }}
+          TF_VAR_container_image: ${{ steps.image.outputs.image_uri }}:${{ steps.image.outputs.image_tag }}
+          TF_VAR_sentry_dsn: ${{ secrets.SENTRY_DSN }}
+          TF_VAR_sentry_environment: ${{ env.SENTRY_ENVIRONMENT }}
+          TF_VAR_sentry_traces_sample_rate: ${{ env.SENTRY_TRACES_SAMPLE_RATE }}
+          TF_VAR_artifact_bucket_name: ${{ vars.ARTIFACT_BUCKET_NAME }}
+          TF_VAR_artifact_prefix: ${{ env.ARTIFACT_PREFIX }}
+          TF_VAR_ecs_log_retention_days: ${{ env.ECS_LOG_RETENTION_DAYS }}
+          TF_VAR_alarm_actions: ${{ vars.CLOUDWATCH_ALARM_ACTIONS_JSON || '[]' }}
+          TF_VAR_nlb_target_resets_alarm_threshold: ${{ env.NLB_TARGET_RESETS_ALARM_THRESHOLD }}
+          TF_VAR_nlb_unhealthy_hosts_threshold: ${{ env.NLB_UNHEALTHY_HOSTS_THRESHOLD }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Read ECS outputs
+        id: ecs
+        working-directory: infra/aws/ecs
+        run: |
+          echo "backend_base_url=$(terraform output -raw backend_base_url)" >> "$GITHUB_OUTPUT"
+          echo "backend_nlb_arn=$(terraform output -raw backend_nlb_arn)" >> "$GITHUB_OUTPUT"
+          echo "backend_target_group_arn=$(terraform output -raw backend_target_group_arn)" >> "$GITHUB_OUTPUT"
+          echo "artifact_bucket_name=$(terraform output -raw artifact_bucket_name)" >> "$GITHUB_OUTPUT"
+          echo "artifact_prefix=$(terraform output -raw artifact_prefix)" >> "$GITHUB_OUTPUT"
+          echo "ecs_log_group_name=$(terraform output -raw ecs_log_group_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for ECS backend health
+        env:
+          TARGET_GROUP_ARN: ${{ steps.ecs.outputs.backend_target_group_arn }}
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${PROJECT_NAME}-cluster" \
+            --services "${PROJECT_NAME}-service"
+
+          for attempt in $(seq 1 30); do
+            health="$(aws elbv2 describe-target-health \
+              --target-group-arn "${TARGET_GROUP_ARN}" \
+              --query 'TargetHealthDescriptions[].TargetHealth.State' \
+              --output text)"
+
+            echo "Target health attempt ${attempt}/30: ${health}"
+            if [ "${health}" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          aws elbv2 describe-target-health --target-group-arn "${TARGET_GROUP_ARN}"
+          echo "ECS target group did not become healthy."
+          exit 1
+
+      - name: Terraform Init API Gateway
+        working-directory: infra/aws/api-gateway
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.tf-backend.outputs.bucket }}" \
+            -backend-config="key=api-gateway/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Plan API Gateway
+        working-directory: infra/aws/api-gateway
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_api_name: ${{ env.API_GATEWAY_NAME }}
+          TF_VAR_stage_name: ${{ env.API_GATEWAY_STAGE_NAME }}
+          TF_VAR_backend_base_url: ${{ steps.ecs.outputs.backend_base_url }}
+          TF_VAR_vpc_link_target_arn: ${{ steps.ecs.outputs.backend_nlb_arn }}
+          TF_VAR_client_api_key_name: ${{ env.API_GATEWAY_CLIENT_KEY_NAME }}
+          TF_VAR_client_api_key_value: ${{ secrets.API_GATEWAY_KEY }}
+          TF_VAR_client_rate_limit: ${{ env.API_GATEWAY_RATE_LIMIT }}
+          TF_VAR_client_burst_limit: ${{ env.API_GATEWAY_BURST_LIMIT }}
+          TF_VAR_log_retention_days: ${{ env.API_GATEWAY_LOG_RETENTION_DAYS }}
+          TF_VAR_alarm_actions: ${{ vars.CLOUDWATCH_ALARM_ACTIONS_JSON || '[]' }}
+          TF_VAR_gateway_5xx_alarm_threshold: ${{ env.GATEWAY_5XX_ALARM_THRESHOLD }}
+          TF_VAR_gateway_latency_alarm_threshold_ms: ${{ env.GATEWAY_LATENCY_ALARM_THRESHOLD_MS }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply API Gateway
+        working-directory: infra/aws/api-gateway
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_api_name: ${{ env.API_GATEWAY_NAME }}
+          TF_VAR_stage_name: ${{ env.API_GATEWAY_STAGE_NAME }}
+          TF_VAR_backend_base_url: ${{ steps.ecs.outputs.backend_base_url }}
+          TF_VAR_vpc_link_target_arn: ${{ steps.ecs.outputs.backend_nlb_arn }}
+          TF_VAR_client_api_key_name: ${{ env.API_GATEWAY_CLIENT_KEY_NAME }}
+          TF_VAR_client_api_key_value: ${{ secrets.API_GATEWAY_KEY }}
+          TF_VAR_client_rate_limit: ${{ env.API_GATEWAY_RATE_LIMIT }}
+          TF_VAR_client_burst_limit: ${{ env.API_GATEWAY_BURST_LIMIT }}
+          TF_VAR_log_retention_days: ${{ env.API_GATEWAY_LOG_RETENTION_DAYS }}
+          TF_VAR_alarm_actions: ${{ vars.CLOUDWATCH_ALARM_ACTIONS_JSON || '[]' }}
+          TF_VAR_gateway_5xx_alarm_threshold: ${{ env.GATEWAY_5XX_ALARM_THRESHOLD }}
+          TF_VAR_gateway_latency_alarm_threshold_ms: ${{ env.GATEWAY_LATENCY_ALARM_THRESHOLD_MS }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Read API Gateway outputs
+        id: gateway
+        working-directory: infra/aws/api-gateway
+        run: |
+          echo "api_gateway_base_url=$(terraform output -raw api_gateway_base_url)" >> "$GITHUB_OUTPUT"
+          echo "access_log_group_name=$(terraform output -raw access_log_group_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify API Gateway health
+        env:
+          API_GATEWAY_BASE_URL: ${{ steps.gateway.outputs.api_gateway_base_url }}
+          CLIENT_API_KEY: ${{ secrets.API_GATEWAY_KEY }}
+        run: |
+          if [ -z "${CLIENT_API_KEY}" ]; then
+            echo "API_GATEWAY_KEY secret is empty or unavailable."
+            exit 1
+          fi
+
+          for attempt in $(seq 1 18); do
+            status="$(curl --silent --show-error \
+              --output /tmp/gateway-health.json \
+              --write-out "%{http_code}" \
+              --header "x-api-key: ${CLIENT_API_KEY}" \
+              "${API_GATEWAY_BASE_URL}/health" || true)"
+
+            if [ "${status}" = "200" ]; then
+              cat /tmp/gateway-health.json
+              exit 0
+            fi
+
+            echo "API Gateway health returned HTTP ${status} on attempt ${attempt}/18."
+            cat /tmp/gateway-health.json || true
+            sleep 10
+          done
+
+          echo "API Gateway health did not become ready."
+          exit 1
+
+      - name: Deployment summary
+        run: |
+          echo "Image: ${{ steps.image.outputs.image_uri }}:${{ steps.image.outputs.image_tag }}"
+          echo "Private backend: ${{ steps.ecs.outputs.backend_base_url }}"
+          echo "Backend NLB ARN: ${{ steps.ecs.outputs.backend_nlb_arn }}"
+          echo "Backend target group ARN: ${{ steps.ecs.outputs.backend_target_group_arn }}"
+          echo "API Gateway: ${{ steps.gateway.outputs.api_gateway_base_url }}"
+          echo "Artifact bucket: ${{ steps.ecs.outputs.artifact_bucket_name }}"
+          echo "Artifact prefix: ${{ steps.ecs.outputs.artifact_prefix }}"
+          echo "ECS logs: ${{ steps.ecs.outputs.ecs_log_group_name }}"
+          echo "Gateway logs: ${{ steps.gateway.outputs.access_log_group_name }}"
+          echo "Terraform state bucket: ${{ steps.tf-backend.outputs.bucket }}"

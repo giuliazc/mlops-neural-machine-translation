@@ -1,0 +1,204 @@
+services:
+  prepare_dataset:
+    profiles: ["prepare"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlops-challenge-ml:local
+    platform: linux/amd64
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - tfds_cache:/tfds
+    environment:
+      TFDS_DATA_DIR: /tfds
+      WRAPT_DISABLE_EXTENSIONS: "1"
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -lc "python -m ml.prepare_dataset
+      --output_dir ${OUTPUT_DIR:-data/processed}
+      --dataset_name ${DATASET_NAME:-para_crawl/enpt}
+      --max_tokens ${MAX_TOKENS:-64}
+      --train_records ${TRAIN_RECORDS:-20000}
+      --val_records ${VAL_RECORDS:-2000}
+      --seed ${SEED:-42}"
+
+  train:
+    profiles: ["train"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlops-challenge-ml:local
+    platform: linux/amd64
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - tfds_cache:/tfds
+    environment:
+      TFDS_DATA_DIR: /tfds
+      WRAPT_DISABLE_EXTENSIONS: "1"
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -lc "python -m ml.train
+      --data_dir ${OUTPUT_DIR:-data/processed}
+      --artifacts_dir ${ARTIFACTS_DIR:-artifacts}
+      --epochs ${EPOCHS:-10}
+      --batch_size ${BATCH_SIZE:-32}
+      --threshold ${THRESHOLD:-0.30}
+      --max_tokens ${MAX_TOKENS:-64}
+      --git_sha ${GIT_SHA:-unknown}"
+
+  publish_artifacts:
+    profiles: ["publish"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlops-challenge-ml:local
+    platform: linux/amd64
+    working_dir: /workspace
+    entrypoint: ["/usr/local/bin/publish-artifacts-entrypoint"]
+    depends_on:
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./:/workspace
+    environment:
+      PYTHONUNBUFFERED: "1"
+      RUN_DIR: ${RUN_DIR:-}
+      ARTIFACT_BUCKET: ${ARTIFACT_BUCKET:-}
+      ARTIFACT_PREFIX: ${ARTIFACT_PREFIX:-models}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_ENDPOINT_URL_S3: ${AWS_ENDPOINT_URL_S3:-}
+      MLOPS_CREATE_ARTIFACT_BUCKET: ${MLOPS_CREATE_ARTIFACT_BUCKET:-}
+    command: >
+      bash -lc "python -m mlops.deployment.publish_artifacts
+      --run_dir \"$${RUN_DIR}\"
+      --bucket \"$${ARTIFACT_BUCKET}\"
+      --prefix \"$${ARTIFACT_PREFIX:-models}\""
+
+  localstack:
+    profiles: ["orchestration", "publish"]
+    image: localstack/localstack:3.8
+    platform: linux/amd64
+    environment:
+      SERVICES: s3
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      DEBUG: "0"
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health | grep '\"s3\": \"\\(available\\|running\\)\"' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  api:
+    profiles: ["api"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlops-challenge-ml:local
+    platform: linux/amd64
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      WRAPT_DISABLE_EXTENSIONS: "1"
+      PYTHONUNBUFFERED: "1"
+      ARTIFACTS_DIR: /workspace/${ARTIFACTS_DIR:-artifacts}
+      DEFAULT_RUN_ID: ${DEFAULT_RUN_ID:-}
+      ARTIFACT_BUCKET: ${ARTIFACT_BUCKET:-}
+      ARTIFACT_PREFIX: ${ARTIFACT_PREFIX:-models}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-local}
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-local}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.2}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    ports:
+      - "${API_PORT:-8000}:8000"
+    command: >
+      bash -lc "uvicorn inference_api.main:app --host 0.0.0.0 --port 8000"
+
+  n8n:
+    container_name: mlops-pipeline-neural-ml-translation-n8n
+    profiles: ["orchestration"]
+    build:
+      context: .
+      dockerfile: Dockerfile.n8n
+    image: mlops-challenge-n8n:local
+    platform: linux/amd64
+    user: root
+    working_dir: ${PWD:-/workspace}
+    entrypoint: ["/usr/local/bin/mlops-n8n-entrypoint"]
+    command: ["n8n", "start"]
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: ${N8N_PORT:-5678}
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      N8N_USER_FOLDER: /home/node
+      N8N_AUTO_IMPORT_WORKFLOW: /workspace/n8n.json
+      N8N_AUTO_IMPORT_WORKFLOW_ID: mlops-nmt-pipeline
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678}
+      NODES_EXCLUDE: '["n8n-nodes-base.localFileTrigger"]'
+      API_GATEWAY_API_KEY: ${API_GATEWAY_API_KEY:-}
+      API_BASE_URL: ${API_BASE_URL:-}
+      ARTIFACT_BUCKET: ${ARTIFACT_BUCKET:-}
+      ARTIFACT_PREFIX: ${ARTIFACT_PREFIX:-models}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_ENDPOINT_URL_S3: ${AWS_ENDPOINT_URL_S3:-}
+      MLOPS_CREATE_ARTIFACT_BUCKET: ${MLOPS_CREATE_ARTIFACT_BUCKET:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:${PWD:-/workspace}
+      - ./:/workspace
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  tests:
+    profiles: ["tests"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlops-challenge-ml:local
+    platform: linux/amd64
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      WRAPT_DISABLE_EXTENSIONS: "1"
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -lc "pytest -q"
+
+volumes:
+  tfds_cache:
+  n8n_data:
+  localstack_data:

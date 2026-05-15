@@ -1,0 +1,96 @@
+openapi: 3.0.1
+info:
+  title: ${api_name}
+  version: "1.0.0"
+  description: API Gateway REST API para expor a Inference API MLOps.
+
+x-amazon-apigateway-api-key-source: HEADER
+
+components:
+  securitySchemes:
+    api_key:
+      type: apiKey
+      name: x-api-key
+      in: header
+
+paths:
+  /health:
+    get:
+      security:
+        - api_key: []
+      x-amazon-apigateway-integration:
+        type: http_proxy
+        httpMethod: GET
+        uri: ${backend_base_url}/health
+        connectionType: VPC_LINK
+        connectionId: ${vpc_link_id}
+        passthroughBehavior: when_no_match
+      responses:
+        "200":
+          description: Health check da API.
+
+  /model:
+    get:
+      security:
+        - api_key: []
+      x-amazon-apigateway-integration:
+        type: http_proxy
+        httpMethod: GET
+        uri: ${backend_base_url}/model
+        connectionType: VPC_LINK
+        connectionId: ${vpc_link_id}
+        passthroughBehavior: when_no_match
+      responses:
+        "200":
+          description: Modelo ativo.
+
+  /metrics:
+    get:
+      security:
+        - api_key: []
+      x-amazon-apigateway-integration:
+        type: http_proxy
+        httpMethod: GET
+        uri: ${backend_base_url}/metrics
+        connectionType: VPC_LINK
+        connectionId: ${vpc_link_id}
+        passthroughBehavior: when_no_match
+      responses:
+        "200":
+          description: Metricas da API.
+
+  /predict:
+    post:
+      security:
+        - api_key: []
+      x-amazon-apigateway-integration:
+        type: http_proxy
+        httpMethod: POST
+        uri: ${backend_base_url}/predict
+        connectionType: VPC_LINK
+        connectionId: ${vpc_link_id}
+        passthroughBehavior: when_no_match
+      responses:
+        "200":
+          description: Traducao realizada.
+        "422":
+          description: Payload invalido.
+        "503":
+          description: Modelo indisponivel.
+
+  /reload:
+    post:
+      security:
+        - api_key: []
+      x-amazon-apigateway-integration:
+        type: http_proxy
+        httpMethod: POST
+        uri: ${backend_base_url}/reload
+        connectionType: VPC_LINK
+        connectionId: ${vpc_link_id}
+        passthroughBehavior: when_no_match
+      responses:
+        "200":
+          description: Modelo recarregado.
+        "500":
+          description: Falha ao recarregar modelo.
